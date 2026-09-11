@@ -46,8 +46,25 @@ def _client_factory(api: FakeApi, exit_ips: dict[str, str | None]):
 	return factory
 
 
-def _rotator(api: FakeApi, exit_ips: dict[str, str | None]) -> NodeRotator:
-	return NodeRotator(api, GROUP, PROXY_URL, client_factory=_client_factory(api, exit_ips))
+def _identity(items: list[str]) -> None:
+	"""不打乱——让测试里的扫描顺序可预测。"""
+
+
+def _rotator(
+	api: FakeApi,
+	exit_ips: dict[str, str | None],
+	*,
+	direct_ip: str | None = None,
+	shuffle=_identity,
+) -> NodeRotator:
+	return NodeRotator(
+		api,
+		GROUP,
+		PROXY_URL,
+		client_factory=_client_factory(api, exit_ips),
+		shuffle=shuffle,
+		direct_ip_provider=lambda: direct_ip,
+	)
 
 
 def test_rotate_selects_a_node_and_reports_its_exit_ip():
@@ -123,6 +140,75 @@ def test_rotate_bounds_how_many_nodes_it_probes(capsys):
 	assert rotator.rotate('Account 1') is None
 	assert len(api.select_calls) <= 8
 	assert 'Account 1' in capsys.readouterr().out
+
+
+def test_rotate_skips_nodes_that_exit_via_the_runner_ip(capsys):
+	# 机场会在订阅里塞「剩余流量」这类伪节点，它们实际是直连 —— 出口就是 runner 自己的 IP
+	api = FakeApi(['剩余流量：189.84 GB', 'B'])
+	rotator = _rotator(api, {'剩余流量：189.84 GB': '9.9.9.9', 'B': '2.2.2.2'}, direct_ip='9.9.9.9')
+
+	assert rotator.rotate('Account 1') == '2.2.2.2'
+	assert '直连' in capsys.readouterr().out
+
+
+def test_rotate_reuses_without_reprobing_nodes_it_already_knows(capsys):
+	# 两个节点都已探明且出口都被占用 —— 复用不该再花任何一次探测
+	api = FakeApi(['A', 'B'])
+	rotator = _rotator(api, {'A': '1.1.1.1', 'B': '2.2.2.2'})
+
+	rotator.rotate('Account 1')
+	rotator.rotate('Account 2')
+	reused = rotator.rotate('Account 3')
+
+	assert reused in {'1.1.1.1', '2.2.2.2'}
+	assert api.select_calls == ['A', 'B']
+	assert '复用' in capsys.readouterr().out
+
+
+def test_shuffling_stops_one_region_from_exhausting_the_probe_budget():
+	# 订阅按地区排列，同地区节点常共用出口 IP。线性扫描会把探测预算烧在同一个 IP 簇里，
+	# 扫不到后面的新鲜 IP —— 这正是实测中「只用掉 5 个 IP 就提示绕回一圈」的原因。
+	nodes = [f'东京{index}号' for index in range(12)] + ['凤凰城1号']
+	exit_ips = {node: '1.1.1.1' for node in nodes[:12]}
+	exit_ips['凤凰城1号'] = '2.2.2.2'
+
+	linear = _rotator(FakeApi(nodes), exit_ips)
+	assert linear.rotate('Account 1') == '1.1.1.1'
+	assert linear.rotate('Account 2') == '1.1.1.1'  # 预算烧光，只能复用同一个 IP
+
+	def fresh_first(items: list[str]) -> None:
+		items.sort(key=lambda name: name != '凤凰城1号')
+
+	shuffled = _rotator(FakeApi(nodes), exit_ips, shuffle=fresh_first)
+	assert shuffled.rotate('Account 1') == '2.2.2.2'
+
+
+def test_rotator_shuffles_the_candidate_order_exactly_once():
+	calls = []
+
+	def spy(items: list[str]) -> None:
+		calls.append(list(items))
+
+	api = FakeApi(['A', 'B'])
+	rotator = _rotator(api, {'A': '1.1.1.1', 'B': '2.2.2.2'}, shuffle=spy)
+
+	rotator.rotate('Account 1')
+	rotator.rotate('Account 2')
+
+	assert calls == [['A', 'B']]
+
+
+def test_rotate_reports_unusable_nodes_only_once(capsys):
+	api = FakeApi(['A', 'B'])
+	rotator = _rotator(api, {'A': None, 'B': '2.2.2.2'})
+
+	rotator.rotate('Account 1')
+	first = capsys.readouterr().out
+	rotator.rotate('Account 2')
+	second = capsys.readouterr().out
+
+	assert '节点 A 不可用' in first
+	assert '节点 A 不可用' not in second
 
 
 def test_node_rotator_from_env_returns_none_without_configuration(monkeypatch):

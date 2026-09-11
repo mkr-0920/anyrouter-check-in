@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import random
 from collections.abc import Callable
 
 import httpx
@@ -15,9 +16,9 @@ GROUP_TYPES = frozenset({'Selector', 'URLTest', 'Fallback', 'LoadBalance', 'Rela
 API_TIMEOUT = 5.0
 EXIT_IP_TIMEOUT = 10.0
 DEFAULT_GROUP = 'CHECKIN'
-# 单次轮转最多探测几个候选：每个候选都要真实出网（最坏 5s 超时），
-# 节点大面积失联时无上界会把整轮时间预算耗光
-MAX_SCAN_PER_ROTATE = 8
+# 单次轮转最多做几次出网探测（不是最多看几个候选）：每个探测最坏 5s 超时，
+# 无上界会在节点大面积失联时耗光整轮时间预算
+MAX_PROBES_PER_ROTATE = 8
 
 
 class MihomoError(Exception):
@@ -96,12 +97,22 @@ def _default_client_factory(proxy_url: str) -> httpx.Client:
 	return httpx.Client(proxy=proxy_url, timeout=EXIT_IP_TIMEOUT)
 
 
+def _default_direct_ip_provider() -> str | None:
+	"""不加代理查 runner 自己的出口 IP，用于识别伪节点。"""
+	with httpx.Client(timeout=EXIT_IP_TIMEOUT) as client:
+		return fetch_exit_ip(client)
+
+
 class NodeRotator:
 	"""按账号轮转出口节点，同一轮内尽量不重复使用同一个出口 IP。
 
 	出口 IP 会被 WAF 按请求量限流，所以「换账号 = 换 IP」比在同一个 IP 上重试更有效。
 	节点池绕完一圈后按「循环复用」处理并明确告警——否则「IP 不够」和「节点都好」
 	在日志里长得一模一样。
+
+	两处细节都来自实测：订阅按地区排列、同地区节点常共用出口 IP（东京1号/2号实测同
+	IP），所以候选要打乱，否则探测预算会全烧在同一个 IP 簇里；机场还会往订阅里塞
+	「剩余流量」这类伪节点，它们实际是直连（出口等于 runner 自己的 IP），必须排除。
 	"""
 
 	def __init__(
@@ -111,14 +122,22 @@ class NodeRotator:
 		proxy_url: str,
 		*,
 		client_factory: Callable[[str], httpx.Client] = _default_client_factory,
+		shuffle: Callable[[list[str]], None] = random.shuffle,
+		direct_ip_provider: Callable[[], str | None] = _default_direct_ip_provider,
 	) -> None:
 		self._api = api
 		self._group = group
 		self._proxy_url = proxy_url
 		self._client_factory = client_factory
-		self._candidates: list[str] | None = None
+		self._shuffle = shuffle
+		self._direct_ip_provider = direct_ip_provider
+		self._order: list[str] | None = None
 		self._cursor = 0
 		self._used_ips: set[str] = set()
+		self._known_ips: dict[str, str] = {}
+		self._unusable: set[str] = set()
+		self._runner_ip: str | None = None
+		self._runner_ip_resolved = False
 
 	@classmethod
 	def from_env(cls) -> NodeRotator | None:
@@ -129,14 +148,22 @@ class NodeRotator:
 			return None
 		return cls(api, DEFAULT_GROUP, proxy_url)
 
-	def _load_candidates(self) -> list[str]:
-		if self._candidates is None:
+	def _load_order(self) -> list[str]:
+		if self._order is None:
 			try:
-				self._candidates = self._api.group_members(self._group)
+				candidates = self._api.group_members(self._group)
 			except MihomoError as exc:
 				print(f'[WARN] 无法读取节点列表，本轮不做出口轮转: {exc}')
-				self._candidates = []
-		return self._candidates
+				candidates = []
+			self._shuffle(candidates)
+			self._order = candidates
+		return self._order
+
+	def _runner_exit_ip(self) -> str | None:
+		if not self._runner_ip_resolved:
+			self._runner_ip = self._direct_ip_provider()
+			self._runner_ip_resolved = True
+		return self._runner_ip
 
 	def _probe_exit_ip(self) -> str | None:
 		with self._client_factory(self._proxy_url) as client:
@@ -148,14 +175,32 @@ class NodeRotator:
 		任何一步失败都只降级为「沿用当前出口」，绝不抛异常——代理切换的问题
 		不该变成跳过签到。返回 None 表示没能切换，调用方照常继续。
 		"""
-		candidates = self._load_candidates()
-		if not candidates:
+		order = self._load_order()
+		if not order:
 			return None
 
+		runner_ip = self._runner_exit_ip()
+		probes = 0
 		fallback: tuple[int, str, str] | None = None
-		for offset in range(min(len(candidates), MAX_SCAN_PER_ROTATE)):
-			index = (self._cursor + offset) % len(candidates)
-			node = candidates[index]
+
+		for offset in range(len(order)):
+			index = (self._cursor + offset) % len(order)
+			node = order[index]
+
+			if node in self._unusable:
+				continue
+
+			known_ip = self._known_ips.get(node)
+			if known_ip is not None and known_ip in self._used_ips:
+				# 已知出口已被占用：免费跳过，不浪费探测预算
+				if fallback is None:
+					fallback = (index, node, known_ip)
+				continue
+
+			if probes >= MAX_PROBES_PER_ROTATE:
+				break
+			probes += 1
+
 			try:
 				self._api.select_node(self._group, node)
 			except MihomoError as exc:
@@ -165,10 +210,20 @@ class NodeRotator:
 			exit_ip = self._probe_exit_ip()
 			if exit_ip is None:
 				print(f'[WARN] {label}: 节点 {node} 不可用，换下一个')
+				self._unusable.add(node)
+				continue
+
+			self._known_ips[node] = exit_ip
+
+			if runner_ip is not None and exit_ip == runner_ip:
+				print(f'[WARN] {label}: 节点 {node} 的出口就是 runner 自己的 IP（实为直连），排除')
+				self._unusable.add(node)
 				continue
 
 			if exit_ip not in self._used_ips:
-				self._commit(index, exit_ip, label, node)
+				self._cursor = (index + 1) % len(order)
+				self._used_ips.add(exit_ip)
+				print(f'[INFO] {label}: 出口节点 {node}（{exit_ip}）')
 				return exit_ip
 
 			if fallback is None:
@@ -180,10 +235,6 @@ class NodeRotator:
 
 		index, node, exit_ip = fallback
 		print(f'[WARN] {label}: 节点池已绕回一圈，开始复用出口 IP {exit_ip}（{node}）')
-		self._commit(index, exit_ip, label, node)
-		return exit_ip
-
-	def _commit(self, index: int, exit_ip: str, label: str, node: str) -> None:
-		self._cursor = (index + 1) % len(self._candidates or [node])
+		self._cursor = (index + 1) % len(order)
 		self._used_ips.add(exit_ip)
-		print(f'[INFO] {label}: 出口节点 {node}（{exit_ip}）')
+		return exit_ip
