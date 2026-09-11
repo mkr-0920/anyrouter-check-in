@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 import checkin
-from checkin import AccountResult, FailureKind, check_in_account_with_retry
+from checkin import AccountResult, FailureKind, check_in_account_with_retry, run_check_in_requests
 from utils.config import AccountConfig, AppConfig, ProviderConfig
 from utils.retry import RetrySettings, load_retry_settings
 
@@ -230,6 +230,42 @@ def test_execute_check_in_reports_non_retryable_status(mocker):
 
 	assert execute_check_in(client, 'Account 1', _provider(), {}, settings) is False
 	assert client.calls == 1
+
+
+def test_run_check_in_requests_logs_the_proxy_exit_ip(monkeypatch, capsys):
+	monkeypatch.setenv('CHECKIN_PROXY_URL', 'http://127.0.0.1:7890')
+	hosts = []
+
+	def handler(request: httpx.Request) -> httpx.Response:
+		hosts.append(request.url.host)
+		if request.url.host == 'api.ipify.org':
+			return httpx.Response(200, text='203.0.113.7\n')
+		return httpx.Response(200, json={'success': True, 'data': {'quota': 0, 'used_quota': 0}})
+
+	real_client = httpx.Client
+	monkeypatch.setattr(
+		checkin.httpx,
+		'Client',
+		lambda **kwargs: real_client(transport=httpx.MockTransport(handler)),
+	)
+
+	provider = ProviderConfig(
+		name='agentrouter',
+		domain='https://agentrouter.org',
+		sign_in_path=None,
+		use_proxy=True,
+	)
+	result = run_check_in_requests(
+		{'session': 'x'},
+		AccountConfig(cookies={'session': 'x'}, name='Account 1'),
+		'Account 1',
+		provider,
+		use_proxy=True,
+	)
+
+	assert result.success is True
+	assert 'api.ipify.org' in hosts
+	assert 'Proxy exit IP: 203.0.113.7' in capsys.readouterr().out
 
 
 def _transient(reason: str = 'connection reset') -> AccountResult:

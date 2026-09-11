@@ -114,12 +114,26 @@ def raise_for_status(response: httpx.Response) -> None:
 		)
 
 
+def _body_snippet(response: httpx.Response, limit: int = 120) -> str:
+	"""取响应体开头用于诊断；空 body 与无法解码分别显式标注。"""
+	try:
+		text = ' '.join(response.text.split())
+	except Exception:  # nosec B110 - 诊断信息，取不到就算了
+		return '<undecodable>'
+	if not text:
+		return '<empty>'
+	return text[:limit]
+
+
 def parse_json(response: httpx.Response) -> Any:
 	"""解析 JSON 响应体；body 不是合法 JSON（常见于代理返回错误页）时按可重试处理。"""
 	try:
 		return response.json()
 	except ValueError as exc:
-		raise RetryableError(f'invalid JSON body: {exc}', response=response) from exc
+		raise RetryableError(
+			f'non-JSON body (HTTP {response.status_code}, {len(response.content)} bytes): {_body_snippet(response)}',
+			response=response,
+		) from exc
 
 
 def is_retryable(exc: BaseException) -> bool:

@@ -195,6 +195,34 @@ def test_parse_json_returns_decoded_payload():
 	assert parse_json(httpx.Response(200, json={'success': True})) == {'success': True}
 
 
+def test_parse_json_reports_status_and_body_when_body_is_html():
+	response = httpx.Response(200, text='<html><body>Access denied by WAF</body></html>')
+
+	with pytest.raises(RetryableError) as excinfo:
+		parse_json(response)
+
+	message = str(excinfo.value)
+	assert 'HTTP 200' in message
+	assert 'Access denied by WAF' in message
+	assert excinfo.value.response is response
+
+
+def test_parse_json_marks_an_empty_body():
+	with pytest.raises(RetryableError) as excinfo:
+		parse_json(httpx.Response(200, text=''))
+
+	assert '<empty>' in str(excinfo.value)
+
+
+def test_parse_json_truncates_a_long_body():
+	with pytest.raises(RetryableError) as excinfo:
+		parse_json(httpx.Response(200, text='x' * 5000))
+
+	message = str(excinfo.value)
+	assert 'x' * 120 in message
+	assert 'x' * 121 not in message
+
+
 def test_invalid_retry_after_header_falls_back_to_backoff():
 	delays = []
 

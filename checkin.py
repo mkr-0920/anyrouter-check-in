@@ -39,7 +39,7 @@ from utils.browser import (
 from utils.config import AccountConfig, AppConfig, load_accounts_config
 from utils.debug import debug_print, is_debug_enabled
 from utils.notify import notify
-from utils.proxy import get_playwright_proxy, get_proxy_server
+from utils.proxy import fetch_exit_ip, get_playwright_proxy, get_proxy_server
 from utils.retry import (
 	PermanentError,
 	RetryableError,
@@ -550,6 +550,14 @@ def run_check_in_requests(
 
 		with httpx.Client(**client_kwargs) as client:
 			client.cookies.update(all_cookies)
+
+			if proxy_url:
+				# 诊断：记录出口 IP，便于判断失败是否源于代理节点中途切换
+				exit_ip = fetch_exit_ip(client)
+				if exit_ip:
+					print(f'[INFO] {account_name}: Proxy exit IP: {exit_ip}')
+				else:
+					print(f'[WARN] {account_name}: Unable to determine proxy exit IP')
 
 			headers = {
 				'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
