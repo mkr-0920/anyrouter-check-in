@@ -6,18 +6,21 @@ from utils.mihomo import MihomoApi
 NODES = ['香港 01', '美国 02', '日本 03']
 PROXY_URL = 'http://127.0.0.1:7890'
 
-PAYLOAD = {
+MEMBERS = {
 	'CHECKIN': {'type': 'Selector', 'now': 'AUTO', 'all': ['AUTO', *NODES]},
 	'AUTO': {'type': 'URLTest', 'now': NODES[0], 'all': NODES},
 	**{node: {'type': 'Shadowsocks', 'name': node} for node in NODES},
 }
+
+# GET /proxies 的响应外层信封
+PROXIES_RESPONSE = {'proxies': MEMBERS}
 
 
 def _mihomo(handler=None) -> MihomoApi:
 	def default_handler(request: httpx.Request) -> httpx.Response:
 		if request.method == 'PUT':
 			return httpx.Response(204)
-		return httpx.Response(200, json=PAYLOAD)
+		return httpx.Response(200, json=PROXIES_RESPONSE)
 
 	return MihomoApi(
 		'http://127.0.0.1:9090',
@@ -78,7 +81,7 @@ def test_probe_continues_after_a_failed_switch():
 			return httpx.Response(500)
 		if request.method == 'PUT':
 			return httpx.Response(204)
-		return httpx.Response(200, json=PAYLOAD)
+		return httpx.Response(200, json=PROXIES_RESPONSE)
 
 	factory, _ = _client_factory(['1.1.1.1', '3.3.3.3'])
 

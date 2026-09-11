@@ -5,16 +5,27 @@ import pytest
 
 from utils.mihomo import MihomoApi, MihomoError, load_mihomo_api
 
-PROXIES_PAYLOAD = {
+MEMBERS = {
 	'CHECKIN': {'type': 'Selector', 'now': 'AUTO', 'all': ['AUTO', '香港 01', '美国 02']},
 	'AUTO': {'type': 'URLTest', 'now': '香港 01', 'all': ['香港 01', '美国 02']},
 	'香港 01': {'type': 'Shadowsocks', 'name': '香港 01'},
 	'美国 02': {'type': 'Vmess', 'name': '美国 02'},
 }
 
+# GET /proxies 返回的是包了一层的信封，条目本身在 proxies 键下面
+PROXIES_RESPONSE = {'proxies': MEMBERS}
+
 
 def _api(handler, *, base_url: str = 'http://127.0.0.1:9090', secret: str = 's3cret') -> MihomoApi:
 	return MihomoApi(base_url, secret, client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+
+def _ok_handler(request: httpx.Request) -> httpx.Response:
+	return httpx.Response(200, json=PROXIES_RESPONSE)
+
+
+def test_proxies_unwraps_the_response_envelope():
+	assert _api(_ok_handler).proxies() == MEMBERS
 
 
 def test_proxies_sends_bearer_token():
@@ -23,7 +34,7 @@ def test_proxies_sends_bearer_token():
 	def handler(request: httpx.Request) -> httpx.Response:
 		seen['url'] = str(request.url)
 		seen['auth'] = request.headers.get('Authorization')
-		return httpx.Response(200, json=PROXIES_PAYLOAD)
+		return httpx.Response(200, json=PROXIES_RESPONSE)
 
 	payload = _api(handler).proxies()
 
@@ -37,7 +48,7 @@ def test_proxies_omits_authorization_when_secret_is_empty():
 
 	def handler(request: httpx.Request) -> httpx.Response:
 		seen['auth'] = request.headers.get('Authorization')
-		return httpx.Response(200, json=PROXIES_PAYLOAD)
+		return httpx.Response(200, json=PROXIES_RESPONSE)
 
 	_api(handler, secret='').proxies()
 
@@ -45,25 +56,24 @@ def test_proxies_omits_authorization_when_secret_is_empty():
 
 
 def test_group_members_excludes_nested_groups():
-	def handler(request: httpx.Request) -> httpx.Response:
-		return httpx.Response(200, json=PROXIES_PAYLOAD)
-
-	assert _api(handler).group_members('CHECKIN') == ['香港 01', '美国 02']
+	assert _api(_ok_handler).group_members('CHECKIN') == ['香港 01', '美国 02']
 
 
 def test_group_members_raises_for_unknown_group():
-	def handler(request: httpx.Request) -> httpx.Response:
-		return httpx.Response(200, json=PROXIES_PAYLOAD)
-
 	with pytest.raises(MihomoError):
-		_api(handler).group_members('NOPE')
+		_api(_ok_handler).group_members('NOPE')
+
+
+def test_unknown_group_error_lists_what_is_actually_available():
+	# 失败时必须带上现场证据，否则分不清「分组名写错」和「响应结构变了」
+	with pytest.raises(MihomoError) as excinfo:
+		_api(_ok_handler).group_members('NOPE')
+
+	assert 'CHECKIN' in str(excinfo.value)
 
 
 def test_current_node_returns_the_selected_member():
-	def handler(request: httpx.Request) -> httpx.Response:
-		return httpx.Response(200, json=PROXIES_PAYLOAD)
-
-	assert _api(handler).current_node('CHECKIN') == 'AUTO'
+	assert _api(_ok_handler).current_node('CHECKIN') == 'AUTO'
 
 
 def test_select_node_puts_the_node_name():

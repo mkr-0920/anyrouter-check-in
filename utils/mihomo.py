@@ -47,24 +47,31 @@ class MihomoApi:
 		return response
 
 	def proxies(self) -> dict:
-		"""返回 /proxies 的完整内容（节点与分组都在里面）。"""
+		"""返回 /proxies 的条目表（节点与分组）。
+
+		注意响应是包了一层的信封：{"proxies": {名字: 条目}}，而 /proxies/{name}
+		才是直接返回条目本身。
+		"""
 		payload = self._request('GET', '/proxies').json()
 		if not isinstance(payload, dict):
 			raise MihomoError('/proxies returned a non-object payload')
-		return payload
+		entries = payload.get('proxies')
+		if not isinstance(entries, dict):
+			raise MihomoError(f'/proxies payload has no "proxies" object, keys={sorted(payload)}')
+		return entries
 
-	def _group_entry(self, group: str) -> dict:
-		entry = self.proxies().get(group)
+	def _group_entry(self, group: str, proxies: dict | None = None) -> dict:
+		entries = self.proxies() if proxies is None else proxies
+		entry = entries.get(group)
 		if not isinstance(entry, dict):
-			raise MihomoError(f'unknown proxy group: {group}')
+			# 带上现场证据，否则分不清「分组名写错」和「响应结构变了」
+			raise MihomoError(f'unknown proxy group: {group} (available: {sorted(entries)[:10]})')
 		return entry
 
 	def group_members(self, group: str) -> list[str]:
 		"""返回分组里可手动选择的真实节点，排除嵌套的分组。"""
 		proxies = self.proxies()
-		entry = proxies.get(group)
-		if not isinstance(entry, dict):
-			raise MihomoError(f'unknown proxy group: {group}')
+		entry = self._group_entry(group, proxies)
 		return [name for name in entry.get('all', []) if proxies.get(name, {}).get('type') not in GROUP_TYPES]
 
 	def current_node(self, group: str) -> str | None:
