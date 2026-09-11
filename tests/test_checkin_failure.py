@@ -359,3 +359,59 @@ async def test_waits_before_retrying(monkeypatch, account):
 	assert result.success is True
 	# 阈值放宽到请求间隔以下，避免 Windows 计时器粒度导致误判
 	assert elapsed >= 0.1
+
+
+async def test_rotates_the_exit_node_before_every_attempt(monkeypatch, retry_env):
+	_patch_account(monkeypatch, _transient(), _succeeded())
+	rotations = []
+
+	class FakeRotator:
+		def rotate(self, label):
+			rotations.append(label)
+			return '1.1.1.1'
+
+	provider = ProviderConfig(name='agentrouter', domain='https://agentrouter.org', use_proxy=True)
+	account = AccountConfig(cookies={'session': 'x'}, name='Account 1', provider='agentrouter')
+
+	result = await check_in_account_with_retry(
+		account,
+		0,
+		AppConfig(providers={'agentrouter': provider}),
+		deadline=None,
+		rotator=FakeRotator(),
+	)
+
+	assert result.success is True
+	assert rotations == ['Account 1', 'Account 1']
+
+
+async def test_does_not_rotate_for_accounts_that_bypass_the_proxy(monkeypatch, retry_env):
+	# 不走代理的 provider 轮转毫无意义，还会白占一个出口 IP 名额
+	_patch_account(monkeypatch, _succeeded())
+	rotations = []
+
+	class FakeRotator:
+		def rotate(self, label):
+			rotations.append(label)
+
+	provider = ProviderConfig(name='anyrouter', domain='https://anyrouter.top', use_proxy=False)
+	account = AccountConfig(cookies={'session': 'x'}, name='Account 1', provider='anyrouter')
+
+	result = await check_in_account_with_retry(
+		account,
+		0,
+		AppConfig(providers={'anyrouter': provider}),
+		deadline=None,
+		rotator=FakeRotator(),
+	)
+
+	assert result.success is True
+	assert rotations == []
+
+
+async def test_works_without_a_rotator(monkeypatch, account, retry_env):
+	_patch_account(monkeypatch, _succeeded())
+
+	result = await check_in_account_with_retry(account, 0, AppConfig(providers={}), deadline=None)
+
+	assert result.success is True

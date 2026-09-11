@@ -38,6 +38,7 @@ from utils.browser import (
 )
 from utils.config import AccountConfig, AppConfig, load_accounts_config
 from utils.debug import debug_print, is_debug_enabled
+from utils.mihomo import NodeRotator
 from utils.notify import notify
 from utils.proxy import fetch_exit_ip, get_playwright_proxy, get_proxy_server
 from utils.retry import (
@@ -494,17 +495,29 @@ async def check_in_account_with_retry(
 	app_config: AppConfig,
 	*,
 	deadline: float | None,
+	rotator: NodeRotator | None = None,
 ) -> AccountResult:
 	"""按配置重试暂时性失败的账号；认证 / 配置类失败直接返回。
 
 	预算只用来取消「重试」，首轮尝试永远会执行——否则前面的账号耗尽预算后，
 	后面的账号会静默漏签。
+
+	传了 rotator 时，每次尝试前都会换一个出口节点：出口 IP 是按请求量限流的，
+	所以「换 IP 重试」才是有意义的重试。
 	"""
 	settings = load_retry_settings()
 	account_name = account.get_display_name(account_index)
 	result = AccountResult(False)
 
+	# 只有走代理的 provider 才需要轮转：为直连账号轮转既无用，又会白占一个出口 IP 名额
+	provider_config = app_config.get_provider(account.provider)
+	should_rotate = rotator is not None and provider_config is not None and provider_config.use_proxy
+
 	for attempt in range(settings.account_max_attempts):
+		if should_rotate:
+			assert rotator is not None
+			rotator.rotate(account_name)
+
 		result = await check_in_account(account, account_index, app_config)
 		if result.success or result.failure_kind is not FailureKind.TRANSIENT:
 			return result
@@ -658,6 +671,12 @@ async def main():
 			f'budget={retry_settings.total_budget:.0f}s'
 		)
 
+	node_rotator = NodeRotator.from_env()
+	if node_rotator is None:
+		print('[INFO] 出口节点轮转未启用（需要 CHECKIN_MIHOMO_API 与 CHECKIN_PROXY_URL）')
+	else:
+		print('[INFO] 出口节点轮转已启用：每次账号尝试前切换出口节点')
+
 	success_count = 0
 	total_count = len(accounts)
 	notification_content = []
@@ -669,7 +688,13 @@ async def main():
 	for i, account in enumerate(accounts):
 		account_key = f'account_{i + 1}'
 		try:
-			result = await check_in_account_with_retry(account, i, app_config, deadline=retry_deadline)
+			result = await check_in_account_with_retry(
+				account,
+				i,
+				app_config,
+				deadline=retry_deadline,
+				rotator=node_rotator,
+			)
 			success = result.success
 			user_info_before = result.before
 			user_info_after = result.after
