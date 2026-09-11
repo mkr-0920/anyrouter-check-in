@@ -15,7 +15,7 @@ def test_retry_settings_defaults_match_the_documented_budget():
 	assert settings.http_max_attempts == 3
 	assert settings.http_base_delay == 1.0
 	assert settings.http_max_delay == 8.0
-	assert settings.account_max_attempts == 2
+	assert settings.account_max_attempts == 3
 	assert settings.account_retry_delay == 5.0
 	assert settings.total_budget == 900.0
 

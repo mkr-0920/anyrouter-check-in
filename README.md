@@ -147,7 +147,7 @@
 | `CHECKIN_HTTP_MAX_ATTEMPTS` | `3` | 单条 HTTP 请求最多尝试次数 |
 | `CHECKIN_HTTP_RETRY_BASE_DELAY_MS` | `1000` | HTTP 层退避基数（毫秒） |
 | `CHECKIN_HTTP_RETRY_MAX_DELAY_MS` | `8000` | HTTP 层单次退避上限（毫秒） |
-| `CHECKIN_ACCOUNT_MAX_ATTEMPTS` | `2` | 单个账号最多尝试次数 |
+| `CHECKIN_ACCOUNT_MAX_ATTEMPTS` | `3` | 单个账号最多尝试次数 |
 | `CHECKIN_ACCOUNT_RETRY_DELAY_MS` | `5000` | 账号重试间隔（毫秒） |
 | `CHECKIN_TOTAL_TIMEOUT_SEC` | `900` | 全局重试预算；设为 `0` 表示不限制 |
 
