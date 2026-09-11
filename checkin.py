@@ -8,7 +8,10 @@ import hashlib
 import json
 import os
 import sys
+import time
+from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 
 if hasattr(sys.stdout, 'reconfigure'):
 	sys.stdout.reconfigure(line_buffering=True)
@@ -37,10 +40,39 @@ from utils.config import AccountConfig, AppConfig, load_accounts_config
 from utils.debug import debug_print, is_debug_enabled
 from utils.notify import notify
 from utils.proxy import get_playwright_proxy, get_proxy_server
+from utils.retry import (
+	PermanentError,
+	RetryableError,
+	RetrySettings,
+	load_retry_settings,
+	parse_json,
+	raise_for_status,
+	retry_call,
+)
 
 load_dotenv()
 
 BALANCE_HASH_FILE = 'balance_hash.txt'
+
+
+class FailureKind(Enum):
+	"""失败性质，决定是否值得重试。"""
+
+	TRANSIENT = 'transient'  # 网络抖动、浏览器启动失败、WAF 未就绪
+	AUTH = 'auth'  # 凭据或会话被拒
+	CONFIG = 'config'  # provider / 账号配置问题
+	UNKNOWN = 'unknown'  # 其余情况
+
+
+@dataclass
+class AccountResult:
+	"""单个账号的签到结果，保留 before/after 供通知使用。"""
+
+	success: bool
+	before: dict | None = None
+	after: dict | None = None
+	failure_kind: FailureKind | None = None
+	reason: str | None = None
 
 
 def load_balance_hash():
@@ -234,26 +266,47 @@ async def login_with_credentials(
 		return None
 
 
-def get_user_info(client, headers, user_info_url: str):
-	"""获取用户信息"""
-	try:
-		response = client.get(user_info_url, headers=headers, timeout=30)
+def _request_json(client: httpx.Client, method: str, url: str, **kwargs) -> tuple[httpx.Response, object]:
+	"""发请求并解析 JSON：可重试状态码、认证失败、坏 body 都转成异常交给 retry_call。"""
+	response = client.request(method, url, **kwargs)
+	raise_for_status(response)
+	if response.status_code != 200:
+		return response, None
+	return response, parse_json(response)
 
-		if response.status_code == 200:
-			data = response.json()
-			if data.get('success'):
-				user_data = data.get('data', {})
-				quota = round(user_data.get('quota', 0) / 500000, 2)
-				used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
-				return {
-					'success': True,
-					'quota': quota,
-					'used_quota': used_quota,
-					'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
-				}
-		return {'success': False, 'error': f'Failed to get user info: HTTP {response.status_code}'}
-	except Exception as e:
-		return {'success': False, 'error': f'Failed to get user info: {str(e)[:50]}...'}
+
+def _http_retry_kwargs(settings: RetrySettings) -> dict:
+	return {
+		'max_attempts': settings.http_max_attempts,
+		'base_delay': settings.http_base_delay,
+		'max_delay': settings.http_max_delay,
+		'budget': settings.total_budget,
+	}
+
+
+def get_user_info(
+	client: httpx.Client,
+	headers: dict,
+	user_info_url: str,
+	settings: RetrySettings,
+) -> dict:
+	"""获取用户信息（网络抖动由 retry_call 吸收，异常交由调用方分类）。"""
+	response, data = retry_call(
+		lambda: _request_json(client, 'GET', user_info_url, headers=headers, timeout=30),
+		**_http_retry_kwargs(settings),
+	)
+
+	if response.status_code == 200 and isinstance(data, dict) and data.get('success'):
+		user_data = data.get('data', {})
+		quota = round(user_data.get('quota', 0) / 500000, 2)
+		used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
+		return {
+			'success': True,
+			'quota': quota,
+			'used_quota': used_quota,
+			'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+		}
+	return {'success': False, 'error': f'Failed to get user info: HTTP {response.status_code}'}
 
 
 async def prepare_cookies(account_name: str, provider_config, user_cookies: dict) -> dict | None:
@@ -277,42 +330,55 @@ async def prepare_cookies(account_name: str, provider_config, user_cookies: dict
 	return {**waf_cookies, **user_cookies}
 
 
-def execute_check_in(client, account_name: str, provider_config, headers: dict):
-	"""执行签到请求"""
+def execute_check_in(
+	client: httpx.Client,
+	account_name: str,
+	provider_config,
+	headers: dict,
+	settings: RetrySettings,
+) -> bool:
+	"""执行签到请求（网络抖动由 retry_call 吸收）。"""
 	print(f'[NETWORK] {account_name}: Executing check-in')
 
 	checkin_headers = headers.copy()
 	checkin_headers.update({'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest'})
 
 	sign_in_url = f'{provider_config.domain}{provider_config.sign_in_path}'
-	response = client.post(sign_in_url, headers=checkin_headers, timeout=30)
+	try:
+		response, result = retry_call(
+			lambda: _request_json(client, 'POST', sign_in_url, headers=checkin_headers, timeout=30),
+			**_http_retry_kwargs(settings),
+		)
+	except RetryableError as exc:
+		# 重试用尽仍拿不到合法 JSON，回退到响应原文匹配（历史行为）
+		if exc.response is not None and 'success' in exc.response.text.lower():
+			print(f'[SUCCESS] {account_name}: Check-in successful!')
+			return True
+		raise
 
 	print(f'[RESPONSE] {account_name}: Response status code {response.status_code}')
 
-	if response.status_code == 200:
-		try:
-			result = response.json()
-			if result.get('ret') == 1 or result.get('code') == 0 or result.get('success'):
-				print(f'[SUCCESS] {account_name}: Check-in successful!')
-				return True
-			else:
-				error_msg = result.get('msg', result.get('message', 'Unknown error'))
-				already_checked_keywords = ['已经签到', '已签到', '重复签到', 'already checked', 'already signed']
-				if any(keyword in error_msg.lower() for keyword in already_checked_keywords):
-					print(f'[SUCCESS] {account_name}: Already checked in today')
-					return True
-				print(f'[FAILED] {account_name}: Check-in failed - {error_msg}')
-				return False
-		except json.JSONDecodeError:
-			if 'success' in response.text.lower():
-				print(f'[SUCCESS] {account_name}: Check-in successful!')
-				return True
-			else:
-				print(f'[FAILED] {account_name}: Check-in failed - Invalid response format')
-				return False
-	else:
+	if response.status_code != 200:
 		print(f'[FAILED] {account_name}: Check-in failed - HTTP {response.status_code}')
 		return False
+
+	if isinstance(result, dict):
+		if result.get('ret') == 1 or result.get('code') == 0 or result.get('success'):
+			print(f'[SUCCESS] {account_name}: Check-in successful!')
+			return True
+		error_msg = str(result.get('msg') or result.get('message') or 'Unknown error')
+		already_checked_keywords = ['已经签到', '已签到', '重复签到', 'already checked', 'already signed']
+		if any(keyword in error_msg.lower() for keyword in already_checked_keywords):
+			print(f'[SUCCESS] {account_name}: Already checked in today')
+			return True
+		print(f'[FAILED] {account_name}: Check-in failed - {error_msg}')
+		return False
+
+	if 'success' in response.text.lower():
+		print(f'[SUCCESS] {account_name}: Check-in successful!')
+		return True
+	print(f'[FAILED] {account_name}: Check-in failed - Invalid response format')
+	return False
 
 
 def format_check_in_notification(detail: dict) -> str:
@@ -350,7 +416,7 @@ def format_check_in_notification(detail: dict) -> str:
 	return '\n'.join(lines)
 
 
-async def check_in_account(account: AccountConfig, account_index: int, app_config: AppConfig):
+async def check_in_account(account: AccountConfig, account_index: int, app_config: AppConfig) -> AccountResult:
 	"""为单个账号执行签到操作"""
 	account_name = account.get_display_name(account_index)
 	print(f'\n[PROCESSING] Starting to process {account_name}')
@@ -358,7 +424,11 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	provider_config = app_config.get_provider(account.provider)
 	if not provider_config:
 		print(f'[FAILED] {account_name}: Provider "{account.provider}" not found in configuration')
-		return False, None, None
+		return AccountResult(
+			False,
+			failure_kind=FailureKind.CONFIG,
+			reason=f'provider "{account.provider}" not found',
+		)
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
 
@@ -382,17 +452,29 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 			auth_method = 'email/password'
 		else:
 			print(f'[FAILED] {account_name}: Email/password login failed, will not use stale session cookies')
-			return False, None, None
+			return AccountResult(
+				False,
+				failure_kind=FailureKind.TRANSIENT,
+				reason='email/password login failed',
+			)
 	else:
 		user_cookies = parse_cookies(account.cookies)
 		if not user_cookies:
 			print(f'[FAILED] {account_name}: Invalid configuration format')
-			return False, None, None
+			return AccountResult(
+				False,
+				failure_kind=FailureKind.CONFIG,
+				reason='invalid cookies configuration',
+			)
 		all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
 		auth_method = 'session cookies'
 
 	if not all_cookies:
-		return False, None, None
+		return AccountResult(
+			False,
+			failure_kind=FailureKind.TRANSIENT,
+			reason='unable to obtain session cookies',
+		)
 
 	print(f'[AUTH] {account_name}: Using auth method -> {auth_method}')
 
@@ -406,6 +488,41 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	)
 
 
+async def check_in_account_with_retry(
+	account: AccountConfig,
+	account_index: int,
+	app_config: AppConfig,
+	*,
+	deadline: float | None,
+) -> AccountResult:
+	"""按配置重试暂时性失败的账号；认证 / 配置类失败直接返回。
+
+	预算只用来取消「重试」，首轮尝试永远会执行——否则前面的账号耗尽预算后，
+	后面的账号会静默漏签。
+	"""
+	settings = load_retry_settings()
+	account_name = account.get_display_name(account_index)
+	result = AccountResult(False)
+
+	for attempt in range(settings.account_max_attempts):
+		result = await check_in_account(account, account_index, app_config)
+		if result.success or result.failure_kind is not FailureKind.TRANSIENT:
+			return result
+		if attempt == settings.account_max_attempts - 1:
+			return result
+		if deadline is not None and time.monotonic() + settings.account_retry_delay > deadline:
+			print(f'[WARN] {account_name}: Retry budget exhausted, skipping retry')
+			return result
+
+		print(
+			f'[WARN] {account_name}: Transient failure ({result.reason}), retrying in '
+			f'{settings.account_retry_delay:.0f}s (attempt {attempt + 2}/{settings.account_max_attempts})'
+		)
+		await asyncio.sleep(settings.account_retry_delay)
+
+	return result
+
+
 def run_check_in_requests(
 	all_cookies: dict,
 	account: AccountConfig,
@@ -414,8 +531,11 @@ def run_check_in_requests(
 	*,
 	api_user_override: str | None = None,
 	use_proxy: bool = False,
-) -> tuple[bool, dict | None, dict | None]:
+) -> AccountResult:
 	"""执行 HTTP 签到请求（同步，避免在 async 上下文中使用阻塞 httpx）。"""
+	settings = load_retry_settings()
+	user_info_before: dict | None = None
+
 	try:
 		client_kwargs: dict = {'http2': True, 'timeout': 30.0}
 		proxy_url = get_proxy_server(use_proxy=use_proxy)
@@ -449,28 +569,42 @@ def run_check_in_requests(
 				headers[provider_config.api_user_key] = api_user
 
 			user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
-			user_info_before = get_user_info(client, headers, user_info_url)
-			if user_info_before and user_info_before.get('success'):
+			user_info_before = get_user_info(client, headers, user_info_url, settings)
+			if user_info_before.get('success'):
 				print(user_info_before['display'])
-			elif user_info_before:
+			else:
 				print(user_info_before.get('error', 'Unknown error'))
 
 			if provider_config.needs_manual_check_in():
-				success = execute_check_in(client, account_name, provider_config, headers)
-				user_info_after = get_user_info(client, headers, user_info_url)
-				return success, user_info_before, user_info_after
+				success = execute_check_in(client, account_name, provider_config, headers, settings)
+				user_info_after = get_user_info(client, headers, user_info_url, settings)
+				return AccountResult(success, before=user_info_before, after=user_info_after)
 
-			user_info_after = get_user_info(client, headers, user_info_url)
-			if user_info_after and user_info_after.get('success'):
+			user_info_after = get_user_info(client, headers, user_info_url, settings)
+			if user_info_after.get('success'):
 				print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
-				return True, user_info_before, user_info_after
-			error = user_info_after.get('error', 'Unknown error') if user_info_after else 'Unknown error'
+				return AccountResult(True, before=user_info_before, after=user_info_after)
+			error = user_info_after.get('error', 'Unknown error')
 			print(f'[FAILED] {account_name}: Auto check-in failed - {error}')
-			return False, user_info_before, user_info_after
+			return AccountResult(
+				False,
+				before=user_info_before,
+				after=user_info_after,
+				failure_kind=FailureKind.UNKNOWN,
+				reason=error,
+			)
 
-	except Exception as e:
-		print(f'[FAILED] {account_name}: Error occurred during check-in process - {str(e)[:50]}...')
-		return False, None, None
+	except PermanentError as exc:
+		print(f'[FAILED] {account_name}: Authentication rejected - {exc}')
+		return AccountResult(False, before=user_info_before, failure_kind=FailureKind.AUTH, reason=str(exc))
+	except (RetryableError, httpx.TransportError) as exc:
+		reason = f'{type(exc).__name__}: {exc}'[:80]
+		print(f'[FAILED] {account_name}: Network error after retries - {reason}')
+		return AccountResult(False, before=user_info_before, failure_kind=FailureKind.TRANSIENT, reason=reason)
+	except Exception as exc:
+		reason = str(exc)[:80]
+		print(f'[FAILED] {account_name}: Error occurred during check-in process - {reason}')
+		return AccountResult(False, before=user_info_before, failure_kind=FailureKind.UNKNOWN, reason=reason)
 
 
 async def main():
@@ -505,6 +639,17 @@ async def main():
 
 	last_balance_hash = load_balance_hash()
 
+	retry_settings = load_retry_settings()
+	retry_deadline = time.monotonic() + retry_settings.total_budget if retry_settings.total_budget else None
+	if retry_deadline is None:
+		print('[INFO] Retry budget disabled (CHECKIN_TOTAL_TIMEOUT_SEC=0)')
+	else:
+		print(
+			f'[INFO] Retry policy: http<={retry_settings.http_max_attempts} attempts, '
+			f'account<={retry_settings.account_max_attempts} attempts, '
+			f'budget={retry_settings.total_budget:.0f}s'
+		)
+
 	success_count = 0
 	total_count = len(accounts)
 	notification_content = []
@@ -516,7 +661,10 @@ async def main():
 	for i, account in enumerate(accounts):
 		account_key = f'account_{i + 1}'
 		try:
-			success, user_info_before, user_info_after = await check_in_account(account, i, app_config)
+			result = await check_in_account_with_retry(account, i, app_config, deadline=retry_deadline)
+			success = result.success
+			user_info_before = result.before
+			user_info_after = result.after
 			if success:
 				success_count += 1
 
@@ -566,6 +714,8 @@ async def main():
 					account_result += f'\n{user_info_after["display"]}'
 				elif user_info_after:
 					account_result += f'\n{user_info_after.get("error", "Unknown error")}'
+				elif result.reason:
+					account_result += f'\n{result.reason}'
 				notification_content.append(account_result)
 
 		except Exception as e:

@@ -132,6 +132,29 @@
 - 报 401 错误，请重新获取 cookies，理论 1 个月失效，但有 Bug，详见 [#6](https://github.com/millylee/anyrouter-check-in/issues/6)
 - 请求 200，但出现 Error 1040（08004）：Too many connections，官方数据库问题，目前已修复，但遇到几次了，详见 [#7](https://github.com/millylee/anyrouter-check-in/issues/7)
 
+## 重试机制
+
+针对 CI 环境下的网络抖动，签到流程内置了两层重试，全部有默认值，通常无需配置。
+
+**HTTP 层**：单条请求遇到连接失败、读写超时、408/429/5xx，或响应体不是合法 JSON（代理返回错误页的典型症状）时，按 1s → 2s → 4s 退避重试。服务端返回 `Retry-After` 时优先采用。401/403 属于凭据或会话失效，不会重试。
+
+**账号层**：整个账号因暂时性原因失败（浏览器启动失败、WAF 未就绪、导航超时、网络错误重试用尽）时会重跑该账号；认证失败、配置错误不重试。
+
+失败被分为四类：`transient`（重试）、`auth`、`config`、`unknown`（后三者不重试）。
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `CHECKIN_HTTP_MAX_ATTEMPTS` | `3` | 单条 HTTP 请求最多尝试次数 |
+| `CHECKIN_HTTP_RETRY_BASE_DELAY_MS` | `1000` | HTTP 层退避基数（毫秒） |
+| `CHECKIN_HTTP_RETRY_MAX_DELAY_MS` | `8000` | HTTP 层单次退避上限（毫秒） |
+| `CHECKIN_ACCOUNT_MAX_ATTEMPTS` | `2` | 单个账号最多尝试次数 |
+| `CHECKIN_ACCOUNT_RETRY_DELAY_MS` | `5000` | 账号重试间隔（毫秒） |
+| `CHECKIN_TOTAL_TIMEOUT_SEC` | `900` | 全局重试预算；设为 `0` 表示不限制 |
+
+预算只用来取消「重试」，不会跳过尚未处理账号的首轮尝试——否则前面的账号耗尽预算后，后面的账号会静默漏签。
+
+副作用：签到接口天然幂等（重复签到会被识别为「已签到」并视为成功），所以重试不会造成重复签到或重复扣费。最坏情况下失败账号的运行时长会翻倍，`CHECKIN_TOTAL_TIMEOUT_SEC` 是兜底。
+
 ## 配置示例
 
 ### 基础配置（向后兼容）
